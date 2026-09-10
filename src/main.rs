@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 //! Repair missing or corrupt Fedora Rawhide refs without rewriting healthy refs.
 
+mod logs;
+
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, Write},
     path::PathBuf,
     process::ExitCode,
@@ -114,7 +118,9 @@ impl Outcome {
 }
 
 fn usage(message: &str) -> String {
-    format!("{message}\nusage: ostree-missing-refs REPOSITORY [--apply]")
+    format!(
+        "{message}\nusage: ostree-missing-refs REPOSITORY [--apply]\n       ostree-missing-refs logs [--compose COMPOSE_ID]"
+    )
 }
 
 fn checksum(value: &str) -> bool {
@@ -130,13 +136,40 @@ fn fallback_ref(raw: &str) -> Option<String> {
         .map(|suffix| format!("{FALLBACK_PREFIX}{suffix}"))
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut values = env::args_os().skip(1);
-    let repo = values
+enum Command {
+    Repair(Args),
+    Logs(logs::Args),
+}
+
+fn parse_args() -> Result<Command, String> {
+    parse_values(env::args_os().skip(1))
+}
+
+fn parse_values(mut values: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let first = values
         .next()
         .ok_or_else(|| usage("missing repository argument"))?;
+    if first == "logs" {
+        let mut logs = logs::Args::default();
+        while let Some(value) = values.next() {
+            match value.to_str() {
+                Some("--compose") => {
+                    let compose = values
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .ok_or_else(|| usage("--compose requires a compose ID"))?;
+                    if logs.compose.replace(compose).is_some() {
+                        return Err(usage("--compose specified more than once"));
+                    }
+                }
+                Some("--help") | Some("-h") => return Err(usage("")),
+                _ => return Err(usage("unknown logs option")),
+            }
+        }
+        return Ok(Command::Logs(logs));
+    }
     let mut args = Args {
-        repo: PathBuf::from(repo),
+        repo: PathBuf::from(first),
         ..Args::default()
     };
     for value in values {
@@ -146,7 +179,7 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(usage("unknown option")),
         }
     }
-    Ok(args)
+    Ok(Command::Repair(args))
 }
 
 fn refs(repo: &Repo, prefix: Option<&str>) -> Result<BTreeMap<String, String>, String> {
@@ -425,7 +458,7 @@ fn main() -> ExitCode {
     {
         info!(
             audit_event = "help",
-            "usage: ostree-missing-refs REPOSITORY [--apply]"
+            "usage: ostree-missing-refs REPOSITORY [--apply]; ostree-missing-refs logs [--compose COMPOSE_ID]"
         );
         return if writer.failed() {
             ExitCode::from(EXIT_ERROR)
@@ -434,7 +467,14 @@ fn main() -> ExitCode {
         };
     }
     let outcome = match parse_args() {
-        Ok(args) => run(args).exit_code(),
+        Ok(Command::Repair(args)) => run(args).exit_code(),
+        Ok(Command::Logs(args)) => match logs::run(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(failure) => {
+                error!(audit_event = "logs_failed", path = %failure.path.display(), error = %failure.message, "compose logs retained for inspection");
+                ExitCode::from(EXIT_ERROR)
+            }
+        },
         Err(message) => {
             error!(audit_event = "usage_error", %message);
             ExitCode::from(EXIT_ERROR)
@@ -491,5 +531,29 @@ mod tests {
         failed.store(false, Ordering::Relaxed);
         assert!(writer.flush().is_ok());
         assert!(failed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn dispatches_logs_without_a_repository() {
+        let command = parse_values(
+            ["logs", "--compose", "Fedora-Rawhide-20260826.n.0"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .unwrap();
+        let Command::Logs(args) = command else {
+            panic!("logs subcommand was not dispatched")
+        };
+        assert_eq!(args.compose.as_deref(), Some("Fedora-Rawhide-20260826.n.0"));
+    }
+
+    #[test]
+    fn treats_dot_slash_logs_as_a_repair_repository_and_rejects_logs_apply() {
+        let repair = parse_values(["./logs"].into_iter().map(OsString::from)).unwrap();
+        let Command::Repair(args) = repair else {
+            panic!("./logs must remain a repository argument")
+        };
+        assert_eq!(args.repo, PathBuf::from("./logs"));
+        assert!(parse_values(["logs", "--apply"].into_iter().map(OsString::from)).is_err());
     }
 }
